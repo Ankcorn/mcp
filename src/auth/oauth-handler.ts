@@ -225,6 +225,7 @@ export function createAuthHandlers() {
         },
         handle: consent.handle,
         headers: consent.headers,
+        upstreamOrigin: new URL(env.CLOUDFLARE_OAUTH_DOMAIN).origin,
         scopeTemplates: SCOPE_TEMPLATES,
         scopeDefinitions: SCOPE_DEFINITIONS,
         requiredScopes: REQUIRED_SCOPES,

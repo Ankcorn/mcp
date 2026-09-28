@@ -166,6 +166,7 @@ Tool usage is tracked via the `MCP_METRICS` Analytics Engine binding into the sh
 - OAuth uses PKCE (RFC 7636) for secure authorization
 - Cookie encryption for OAuth sessions (`MCP_COOKIE_ENCRYPTION_KEY`)
 - The `/mcp` route validates Host and present browser Origin headers against deployment-static allowlists before authentication
+- The consent and error pages send a nonce-based Content-Security-Policy: inline `<script>` and `<style>` need the response's nonce, and inline event handlers, `javascript:` URLs and `style` attributes are blocked. The consent form's `form-action` lists Cloudflare's authorization origin and the client's redirect origin, because Chrome checks each redirect after a form submission
 
 ## Testing
 

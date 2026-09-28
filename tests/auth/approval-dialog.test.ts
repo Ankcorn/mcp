@@ -20,7 +20,6 @@ function renderResponse(options: Partial<ApprovalDialogOptions> = {}): Response 
     server: { name: 'Cloudflare API MCP' },
     handle: 'test-consent-handle',
     headers: new Headers({ 'Set-Cookie': '__Host-oauth-consent-0123456789abcdef=test' }),
-    upstreamOrigin: 'https://dash.cloudflare.com',
     scopeTemplates: {},
     scopeDefinitions: {},
     requiredScopes: [],
@@ -33,14 +32,14 @@ function render(options: Partial<ApprovalDialogOptions> = {}): Promise<string> {
   return renderResponse(options).text()
 }
 
-function loopbackConsent(redirectUri: string): ApprovalDialogOptions['consent'] {
+function consentRedirectingTo(redirectUri: string): ApprovalDialogOptions['consent'] {
+  const { hostname } = new URL(redirectUri)
   return {
-    clientId: 'https://client.example/oauth/client.json',
-    clientDomain: 'client.example',
-    clientName: 'Native client',
+    clientId: 'opaque-client-id',
+    clientName: 'Test client',
     redirectUri,
-    redirectHost: new URL(redirectUri).hostname,
-    redirectIsLoopback: true,
+    redirectHost: hostname,
+    redirectIsLoopback: hostname !== 'callback.example',
     scope: []
   }
 }
@@ -48,8 +47,8 @@ function loopbackConsent(redirectUri: string): ApprovalDialogOptions['consent'] 
 /** The nonce a page's policy lets scripts run with. */
 function policyNonce(policy: string | null): string {
   const nonce = policy?.match(/script-src 'nonce-([^']+)'/)?.[1]
-  expect(nonce).toBeTruthy()
-  return nonce!
+  if (!nonce) throw new Error(`No script nonce in the policy: ${policy}`)
+  return nonce
 }
 
 /**
@@ -198,31 +197,33 @@ describe('OAuth page Content-Security-Policy', () => {
     expect(first).not.toBe(second)
   })
 
-  it('lets both buttons reach their redirects: Cloudflare and the client', () => {
-    // Chrome applies form-action to the redirect that follows a submission.
-    expect(renderResponse().headers.get('Content-Security-Policy')).toContain(
-      "form-action 'self' https://dash.cloudflare.com https://callback.example"
+  it('gives every client the same policy, with no form-action to stop Continue or Cancel redirecting', () => {
+    // Chrome applies form-action to the redirect after a submission: to Cloudflare on Continue,
+    // to the client on Cancel. CSP can't name an IPv6 literal, and the client picks its origin.
+    const policies = [
+      'https://callback.example/oauth/callback',
+      'http://127.0.0.1:6274/oauth/callback',
+      'http://[::1]:6274/oauth/callback'
+    ].map((redirectUri) =>
+      renderResponse({ consent: consentRedirectingTo(redirectUri) })
+        .headers.get('Content-Security-Policy')
+        ?.replaceAll(/'nonce-[^']+'/g, "'nonce'")
     )
-    const loopback = renderResponse({
-      consent: loopbackConsent('http://127.0.0.1:6274/oauth/callback')
-    })
-    expect(loopback.headers.get('Content-Security-Policy')).toContain(
-      "form-action 'self' https://dash.cloudflare.com http://127.0.0.1:6274"
-    )
+
+    expect(new Set(policies).size).toBe(1)
+    expect(policies[0]).not.toContain('form-action')
   })
 
-  it.each(['http://[::1]:6274/oauth/callback', 'cursor://anysphere.cursor-mcp/oauth/callback'])(
-    'leaves out form-action for a redirect URI CSP cannot name: %s',
-    (redirectUri) => {
-      const policy = renderResponse({ consent: loopbackConsent(redirectUri) }).headers.get(
-        'Content-Security-Policy'
-      )
+  it('escapes the client name in the title bar', async () => {
+    const body = await render({
+      consent: {
+        ...consentRedirectingTo('https://callback.example/cb'),
+        clientName: '</title><b>x'
+      }
+    })
 
-      expect(policy).not.toContain('form-action')
-      expect(policy).not.toContain('null')
-      policyNonce(policy)
-    }
-  )
+    expect(body).toContain('<title>Authorize &lt;/title&gt;&lt;b&gt;x | Cloudflare</title>')
+  })
 
   it('runs only the script and styles the error page ships', async () => {
     const response = renderErrorPage('Server Error', 'Try again.')

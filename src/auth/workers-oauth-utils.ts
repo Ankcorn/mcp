@@ -77,11 +77,6 @@ export interface ApprovalDialogOptions {
   handle: string
   /** From `beginConsent()`: the browser binding cookie and anti-framing headers. */
   headers: Headers
-  /**
-   * Origin of Cloudflare's authorization page. Approving redirects there, and Chrome applies the
-   * consent form's form-action to that redirect.
-   */
-  upstreamOrigin: string
   scopeTemplates: Record<string, ScopeTemplate>
   scopeDefinitions: Readonly<Record<string, ScopeDefinition>>
   requiredScopes: readonly string[]
@@ -108,13 +103,33 @@ function generateCspNonce(): string {
   return btoa(binary)
 }
 
+/** What a consent or error page puts inside the shared page chrome. */
+interface Page {
+  /** Plain text for the title bar; escaped here. */
+  readonly title: string
+  /** The page's CSS, after the shared chrome's. */
+  readonly css: string
+  /** The card's markup. Client-supplied values in it must already be escaped. */
+  readonly card: string
+  /** The page's script, if it has one. */
+  readonly script?: string
+  /** `'none'` for a page without a form. The consent page leaves it out: see `contentSecurityPolicy()`. */
+  readonly formAction?: "'none'"
+}
+
 /**
- * Content-Security-Policy for the consent and error pages. Their inline script and styles run
- * only with this response's nonce, so markup injected through an escaping mistake can't execute.
- * `formAction` lists every origin a form submission may end at; without it the directive is
- * left out.
+ * Content-Security-Policy for the consent and error pages. They show client-supplied text, all of
+ * it escaped; this is the backstop for a value that ever isn't. Only the response's own inline
+ * script and styles run, nothing can frame the page, and a `<base>` can't rebase its links or
+ * its form.
+ *
+ * The consent page has no form-action. Chrome checks form-action against the redirect after a
+ * submission as well, so Continue needs Cloudflare's origin listed and Cancel the client's
+ * redirect origin. That origin belongs to the same client that supplies the page's text, so
+ * listing it would let an injected form post there too, and an IPv6 loopback redirect URI can't
+ * be listed at all. The form's only field is a handle bound to this browser.
  */
-function contentSecurityPolicy(nonce: string, formAction?: readonly string[]): string {
+function contentSecurityPolicy(nonce: string, formAction: Page['formAction']): string {
   const directives = [
     "default-src 'none'",
     `script-src 'nonce-${nonce}'`,
@@ -124,22 +139,45 @@ function contentSecurityPolicy(nonce: string, formAction?: readonly string[]): s
     "base-uri 'none'",
     "frame-ancestors 'none'"
   ]
-  if (formAction) directives.push(`form-action ${formAction.join(' ')}`)
+  if (formAction) directives.push(`form-action ${formAction}`)
   return directives.join('; ')
 }
 
 /**
- * Where a consent form submission can end up. Chrome checks form-action against every redirect
- * after a submission: approving redirects to Cloudflare's authorization page, and denying
- * redirects to the client's redirect URI. CSP can't name an IPv6 literal, and a private-use
- * scheme has no origin, so those clients get no form-action rather than a Cancel button that
- * goes nowhere.
+ * Render a consent or error page. The nonce is generated here, put on the page's only `<style>`
+ * and `<script>`, and named in the Content-Security-Policy on the same response, so no inline code
+ * can run without it and no page has to remember it. `headers` is updated in place, so the consent
+ * page keeps `beginConsent()`'s binding cookie; the policy replaces its frame-ancestors-only one.
  */
-function consentFormAction(upstreamOrigin: string, redirectUri: string): string[] | undefined {
-  const redirect = new URL(redirectUri)
-  const isWebOrigin = redirect.protocol === 'https:' || redirect.protocol === 'http:'
-  if (!isWebOrigin || redirect.hostname.startsWith('[')) return undefined
-  return [...new Set(["'self'", upstreamOrigin, redirect.origin])]
+function renderPage(
+  page: Page,
+  { headers = new Headers(), status = 200 }: { headers?: Headers; status?: number } = {}
+): Response {
+  const nonce = generateCspNonce()
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${sanitizeHtml(page.title)} | Cloudflare</title>
+  ${PAGE_FONT_LINKS}
+  <style nonce="${nonce}">${PAGE_CHROME_CSS}${page.css}</style>
+</head>
+<body>
+  ${PAGE_HEADER_HTML}
+  <main class="main">
+    <div class="card">${page.card}</div>
+  </main>
+  ${PAGE_FOOTER_HTML}
+  ${page.script === undefined ? '' : `<script nonce="${nonce}">${page.script}</script>`}
+</body>
+</html>
+`
+
+  headers.set('Content-Security-Policy', contentSecurityPolicy(nonce, page.formAction))
+  headers.set('Content-Type', 'text/html; charset=utf-8')
+  headers.set('X-Frame-Options', 'DENY')
+  return new Response(html, { status, headers })
 }
 
 /**
@@ -344,7 +382,6 @@ export function renderApprovalDialog(request: Request, options: ApprovalDialogOp
     consent,
     handle,
     headers,
-    upstreamOrigin,
     scopeTemplates,
     scopeDefinitions,
     requiredScopes,
@@ -363,7 +400,6 @@ export function renderApprovalDialog(request: Request, options: ApprovalDialogOp
     : undefined
   const isLocalRedirect = consent.redirectIsLoopback
   const requiredSet = new Set(requiredScopes)
-  const nonce = generateCspNonce()
 
   const templateDataJson = JSON.stringify(
     Object.fromEntries(Object.entries(scopeTemplates).map(([k, v]) => [k, v.scopes]))
@@ -396,15 +432,10 @@ export function renderApprovalDialog(request: Request, options: ApprovalDialogOp
           </div>`
       : ''
 
-  const htmlContent = `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Authorize ${clientName} | Cloudflare</title>
-  ${PAGE_FONT_LINKS}
-  <style nonce="${nonce}">${PAGE_CHROME_CSS}
+  return renderPage(
+    {
+      title: `Authorize ${consent.clientName}`,
+      css: `
     .card-header { padding: 1.5rem 2rem; border-bottom: 1px solid var(--kumo-line); text-align: center; }
     /* Kumo Text variant="heading" size="lg" */
     .card-title { font-size: 20px; font-weight: 600; line-height: 1.4; }
@@ -557,13 +588,8 @@ export function renderApprovalDialog(request: Request, options: ApprovalDialogOp
       .actions .button { flex: 1 1 100%; }
       .actions .button-primary { order: -1; }
     }
-  </style>
-</head>
-<body>
-  ${PAGE_HEADER_HTML}
-
-  <main class="main">
-    <div class="card">
+  `,
+      card: `
       <div class="card-header">
         <h1 class="card-title">Authorize application</h1>
         <p class="card-subtitle">Grant access to Cloudflare API</p>
@@ -620,12 +646,8 @@ export function renderApprovalDialog(request: Request, options: ApprovalDialogOp
           </div>
         </form>
       </div>
-    </div>
-  </main>
-
-  ${PAGE_FOOTER_HTML}
-
-  <script nonce="${nonce}">
+    `,
+      script: `
     (function() {
       const TEMPLATES = ${templateDataJson};
       const TEMPLATE_NAMES = ${templateNamesJson};
@@ -754,19 +776,10 @@ export function renderApprovalDialog(request: Request, options: ApprovalDialogOp
       renderTemplates();
       applyTemplate(INITIAL_TEMPLATE);
     })();
-  </script>
-</body>
-</html>
-`
-
-  // beginConsent() headers: the browser binding cookie, no-store and X-Frame-Options DENY. This
-  // policy replaces its frame-ancestors-only CSP and keeps frame-ancestors 'none'.
-  headers.set(
-    'Content-Security-Policy',
-    contentSecurityPolicy(nonce, consentFormAction(upstreamOrigin, consent.redirectUri))
+  `
+    },
+    { headers }
   )
-  headers.set('Content-Type', 'text/html; charset=utf-8')
-  return new Response(htmlContent, { headers })
 }
 
 /**
@@ -813,16 +826,10 @@ export function renderErrorPage(
   details?: string,
   status = 400
 ): Response {
-  const nonce = generateCspNonce()
-  const htmlContent = `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${sanitizeHtml(title)} | Cloudflare</title>
-  ${PAGE_FONT_LINKS}
-  <style nonce="${nonce}">${PAGE_CHROME_CSS}
+  return renderPage(
+    {
+      title,
+      css: `
     .main { align-items: center; }
     .card { max-width: 440px; padding: 2.5rem 2rem; text-align: center; }
     .error-icon {
@@ -850,12 +857,8 @@ export function renderErrorPage(
       text-align: left;
       word-break: break-word;
     }
-  </style>
-</head>
-<body>
-  ${PAGE_HEADER_HTML}
-  <main class="main">
-    <div class="card">
+  `,
+      card: `
       <div class="error-icon">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="12" cy="12" r="10"/>
@@ -867,22 +870,12 @@ export function renderErrorPage(
       <p class="card-message">${sanitizeHtml(message)}</p>
       ${details ? `<div class="error-details">${sanitizeHtml(details)}</div>` : ''}
       <button type="button" class="button button-primary" id="closeWindow"><span class="button-label">Close window</span></button>
-    </div>
-  </main>
-  ${PAGE_FOOTER_HTML}
-  <script nonce="${nonce}">
+    `,
+      script: `
     document.getElementById('closeWindow').addEventListener('click', () => window.close());
-  </script>
-</body>
-</html>
-`
-
-  return new Response(htmlContent, {
-    status,
-    headers: {
-      'Content-Security-Policy': contentSecurityPolicy(nonce, ["'none'"]),
-      'Content-Type': 'text/html; charset=utf-8',
-      'X-Frame-Options': 'DENY'
-    }
-  })
+  `,
+      formAction: "'none'"
+    },
+    { status }
+  )
 }

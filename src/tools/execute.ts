@@ -8,11 +8,9 @@ import { formatError } from '../utils/errors'
 import {
   ACCOUNT_DISCOVERY_DESCRIPTION,
   ACCOUNT_DISCOVERY_GUIDANCE,
-  accountTokenId,
   autoResolvedAccountId,
-  inlineableAccounts,
-  isMultiAccountUser,
-  isSingleAccountUser
+  missingAccountMessage,
+  unknownAccountHint
 } from '../auth/account-access'
 import type { AuthProps } from '../auth/types'
 
@@ -62,7 +60,8 @@ export class GlobalOutbound extends WorkerEntrypoint<Env, GlobalOutboundProps> {
 async function runExecute(
   code: string,
   accountId: string | undefined,
-  apiToken: string
+  apiToken: string,
+  unresolvedAccountMessage: string
 ): Promise<unknown> {
   const apiBase = env.CLOUDFLARE_API_BASE
   const workerId = `cloudflare-api-${crypto.randomUUID()}`
@@ -71,7 +70,6 @@ async function runExecute(
   // don't bind a usable `accountId`. Account-independent calls (GET /accounts,
   // GET /user) never touch it, but any code that reads it fails fast with a
   // clear message instead of silently producing `/accounts//...` (a 404).
-  const unresolvedAccountMessage = `No account selected: this token has access to multiple accounts. ${ACCOUNT_DISCOVERY_GUIDANCE}`
   const accountIdPrelude = accountId
     ? `const accountId = ${JSON.stringify(accountId)};`
     : `Object.defineProperty(globalThis, "accountId", { configurable: true, get() {
@@ -204,50 +202,20 @@ export default class CodeExecutor extends WorkerEntrypoint {
 }
 
 /**
- * The `CLOUDFLARE_TYPES` block plus a per-session comment describing how
- * `accountId` is resolved for this token (pinned, single account, or chosen
- * per call).
+ * Description for the `execute` tool: the Cloudflare type declarations, how
+ * `accountId` is resolved, and a multipart Worker-upload example.
+ *
+ * It is the same for every session. MCP clients cache tool metadata and may
+ * serve one user's tool list to another, so nothing here may depend on the
+ * token: no account ids or names, and no branching on token shape.
  */
-function cloudflareTypesForAccount(props?: AuthProps): string {
-  // Single-account user token: name the account so the LLM can confirm it.
-  if (isSingleAccountUser(props)) {
-    return (
-      CLOUDFLARE_TYPES +
-      `\n// accountId is pre-set to "${props.accounts[0].id}" (${props.accounts[0].name}) — use it directly in API paths.\n`
-    )
-  }
-
-  // Any other pinned account id (account-scoped token).
-  const pinnedAccountId = autoResolvedAccountId(props)
-  if (pinnedAccountId) {
-    return (
-      CLOUDFLARE_TYPES +
-      `\n// accountId is pre-set to "${pinnedAccountId}" — use it directly in API paths.\n`
-    )
-  }
-
-  if (isMultiAccountUser(props)) {
-    return (
-      CLOUDFLARE_TYPES +
-      `\n// accountId is set from the optional account_id tool argument. Reading it before selecting an account throws an error.\n`
-    )
-  }
-
-  return CLOUDFLARE_TYPES
-}
-
-/**
- * Description for the `execute` tool, including the per-session Cloudflare type
- * declarations and a multipart Worker-upload example.
- */
-function executeToolDescription(props?: AuthProps): string {
-  const types = cloudflareTypesForAccount(props)
-  const accountSelection = accountSelectionDescription(props)
-
-  return `Execute JavaScript code that can read, create, update, or delete resources through the Cloudflare API. First use the 'search' tool to find the right endpoints, then write code using the cloudflare.request() function.
+const EXECUTE_TOOL_DESCRIPTION = `Execute JavaScript code that can read, create, update, or delete resources through the Cloudflare API. First use the 'search' tool to find the right endpoints, then write code using the cloudflare.request() function.
 
 Available in your code:
-${types}${accountSelection}
+${CLOUDFLARE_TYPES}
+// accountId is the account_id tool argument when passed; otherwise the session's account when it is authorized for exactly one. Reading it when neither applies throws an error.
+
+When the session has access to multiple accounts, pass account_id. ${ACCOUNT_DISCOVERY_DESCRIPTION}
 
 Your code must be an async arrow function that returns the result.
 
@@ -259,41 +227,19 @@ async () => {
   const body = [\`--\${b}\`, 'Content-Disposition: form-data; name="metadata"', 'Content-Type: application/json', '', JSON.stringify(metadata), \`--\${b}\`, 'Content-Disposition: form-data; name="script"', 'Content-Type: application/javascript', '', code, \`--\${b}--\`].join("\\r\\n");
   return cloudflare.request({ method: "PUT", path: \`/accounts/\${accountId}/workers/scripts/my-worker\`, body, contentType: \`multipart/form-data; boundary=\${b}\`, rawBody: true });
 }`
-}
 
-function accountSelectionDescription(props?: AuthProps): string {
-  if (!isMultiAccountUser(props)) return ''
-
-  const accounts = inlineableAccounts(props)
-  if (accounts) {
-    const list = accounts.map((account) => `- ${account.id} (${account.name})`).join('\n')
-    return `
-
-Available accounts:
-${list}`
-  }
-
-  const access =
-    props.accountCount !== undefined
-      ? `This token has access to ${props.accountCount} Cloudflare accounts.`
-      : 'This token has access to multiple Cloudflare accounts.'
-  return `
-
-${access} ${ACCOUNT_DISCOVERY_DESCRIPTION}`
-}
-
-function accountIdParamDescription(): string {
-  return 'Cloudflare account ID to scope execution to a singular account. Optional for account-independent calls.'
-}
+const ACCOUNT_ID_PARAM_DESCRIPTION =
+  'Cloudflare account ID to run against. Optional when the session is authorized for exactly one account, and for account-independent calls such as GET /accounts.'
 
 /**
  * Register the `execute` tool: runs sandboxed JavaScript against the Cloudflare
  * API via `cloudflare.request()`.
  *
- * Two shapes depending on the session:
- *  - Account token (pinned account): `account_id` is fixed, not a parameter.
- *  - User token: `account_id` selects the account, and may be omitted for
- *    account-independent discovery calls such as `GET /accounts`.
+ * The metadata is identical for every token (see `EXECUTE_TOOL_DESCRIPTION`);
+ * only the handler looks at the session. An explicit `account_id` wins,
+ * otherwise the account is auto-resolved for account tokens and single-account
+ * user tokens. An account token given another account's id is rejected by the
+ * Cloudflare API, the same as any other account it can't access.
  *
  * `formatResult` turns the value the code returns into the tool's text output.
  */
@@ -303,45 +249,15 @@ export function registerExecuteTool(
   formatResult: FormatToolResult
 ): void {
   const apiToken = props.accessToken
-  const description = executeToolDescription(props)
-  const pinnedAccountId = accountTokenId(props)
-
-  if (pinnedAccountId) {
-    server.registerTool(
-      'execute',
-      {
-        title: 'Cloudflare API Code Executor',
-        description,
-        inputSchema: z.object({
-          code: z.string().describe('JavaScript async arrow function to execute')
-        }),
-        annotations: {
-          title: 'Cloudflare API Code Executor',
-          readOnlyHint: false,
-          openWorldHint: true,
-          destructiveHint: true
-        }
-      },
-      async ({ code }) => {
-        try {
-          const result = await runExecute(code, pinnedAccountId, apiToken)
-          return { content: [{ type: 'text', text: formatResult(result) }] }
-        } catch (error) {
-          return formatError(error)
-        }
-      }
-    )
-    return
-  }
 
   server.registerTool(
     'execute',
     {
       title: 'Cloudflare API Code Executor',
-      description,
+      description: EXECUTE_TOOL_DESCRIPTION,
       inputSchema: z.object({
         code: z.string().describe('JavaScript async arrow function to execute'),
-        account_id: z.string().optional().describe(accountIdParamDescription())
+        account_id: z.string().optional().describe(ACCOUNT_ID_PARAM_DESCRIPTION)
       }),
       annotations: {
         title: 'Cloudflare API Code Executor',
@@ -357,10 +273,18 @@ export function registerExecuteTool(
         // code that reads `accountId` then fails fast with a clear message.
         const effectiveAccountId = account_id || autoResolvedAccountId(props)
 
-        const result = await runExecute(code, effectiveAccountId, apiToken)
+        const result = await runExecute(
+          code,
+          effectiveAccountId,
+          apiToken,
+          missingAccountMessage(props, ACCOUNT_DISCOVERY_GUIDANCE)
+        )
         return { content: [{ type: 'text', text: formatResult(result) }] }
       } catch (error) {
-        return formatError(error)
+        const failure = formatError(error)
+        const hint = account_id ? unknownAccountHint(props, account_id) : ''
+        if (hint) failure.content[0].text += `\n\n${hint}`
+        return failure
       }
     }
   )

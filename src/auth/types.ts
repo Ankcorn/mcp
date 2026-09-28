@@ -14,8 +14,8 @@ export const AccountsSchema = z.array(AccountSchema)
 
 /**
  * Max accounts whose IDs/names we are willing to store on a grant or in the
- * identity cache (and inline into prompt metadata). Above this, only the count
- * is kept so we never persist a long, potentially-sensitive account list.
+ * identity cache. Above this, only the count is kept so we never persist a
+ * long, potentially-sensitive account list.
  */
 export const MAX_STORED_ACCOUNTS = 30
 

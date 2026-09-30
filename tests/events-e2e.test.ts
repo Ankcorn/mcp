@@ -3,6 +3,7 @@ import { getOAuthApi } from '@cloudflare/workers-oauth-provider'
 import { http, HttpResponse } from 'msw'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AUTOMATIONS, POLICIES, WEBHOOKS } from '../src/events/api'
+import { USER_AGENT } from '../src/constants'
 import { API_BASE, cfSuccess, mockIdentityProbe } from './helpers/cloudflare-api'
 import { clearKv } from './helpers/kv'
 import { modernMcpRequest } from './helpers/mcp'
@@ -146,6 +147,7 @@ beforeEach(async () => {
     }),
     http.all(`${API_BASE}/accounts/${accountId}/*`, async ({ request }) => {
       expect(request.headers.get('Authorization')).toBe(`Bearer ${token}`)
+      expect(request.headers.get('User-Agent')).toBe(USER_AGENT)
       const path = new URL(request.url).pathname.slice(`/client/v4/accounts/${accountId}`.length)
       const collection = [WEBHOOKS, POLICIES, AUTOMATIONS].find(
         (prefix) => path === prefix || path.startsWith(prefix + '/')
@@ -391,6 +393,19 @@ describe('MCP Events through the real Worker', () => {
     expect((await exports.default.fetch(ansRequest())).status).toBe(503)
     policyReadStatus = 403
     expect((await exports.default.fetch(ansRequest())).status).toBe(204)
+    expect(deliveries).toHaveLength(0)
+  })
+
+  it('leaves rate-limited delivery authorization checks to ANS without local retries', async () => {
+    await rpc('events/subscribe', params)
+    requests.length = 0
+    policyReadStatus = 429
+    expect((await exports.default.fetch(ansRequest())).status).toBe(503)
+    expect(
+      requests.filter(
+        (request) => request.method === 'GET' && request.path.startsWith(POLICIES + '/')
+      )
+    ).toHaveLength(1)
     expect(deliveries).toHaveLength(0)
   })
 

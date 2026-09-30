@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import type { AuthProps } from '../auth/types'
+import { fetchWithRetry } from '../utils/fetch-retry'
 import { EventApi, EventApiError, AUTOMATIONS, POLICIES, WEBHOOKS } from './api'
 import {
   CallbackUrl,
@@ -121,13 +122,14 @@ export class EventService {
       accounts = [this.props.account]
     } else {
       const page = Number(cursor ?? '1')
-      const response = await fetch(
+      const response = await fetchWithRetry(
         `${this.env.CLOUDFLARE_API_BASE}/accounts?page=${page}&per_page=20`,
         {
           headers: { Authorization: `Bearer ${this.props.accessToken}` },
           redirect: 'manual',
           signal: AbortSignal.timeout(10_000)
-        }
+        },
+        { maxRetries: 0, caller: 'mcp_events_account_discovery' }
       )
       if (!response.ok) throw new EventApiError(response.status)
       const value = z

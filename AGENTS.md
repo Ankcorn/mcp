@@ -21,6 +21,7 @@ cloudflare-mcp/
 │   ├── index.ts                   # Worker entry point & OAuth routing
 │   ├── mcp-handler.ts             # Stateless MCP HTTP handler & deployment guards
 │   ├── server.ts                  # MCP server setup & tool registration
+│   ├── events/                    # Draft ANS-backed MCP Events contract and bridge (not enabled)
 │   ├── executor.ts                # Code executor (Worker Loader API)
 │   ├── spec-processor.ts          # OpenAPI spec fetching & $ref resolution
 │   ├── truncate.ts                # Response truncation (~6K token limit)

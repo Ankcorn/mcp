@@ -28,7 +28,7 @@ const subscription: Subscription = {
 }
 const params = {
   name: 'cloudflare.alert.workers_observability_real_time_issue',
-  arguments: { account_id: accountId, filters: { services: ['my-worker'] } },
+  arguments: { account_id: accountId, service: 'my-worker', afterOccurrences: 1 },
   delivery: { mode: 'webhook', url: subscription.callbackUrl, secret }
 }
 const alert = {
@@ -77,7 +77,13 @@ describe('MCP event contract', () => {
   it.each([
     'http://receiver.example',
     'https://user:pass@receiver.example',
-    'https://receiver.example/#fragment'
+    'https://receiver.example/#fragment',
+    'https://127.0.0.1/events',
+    'https://2130706433/events',
+    'https://[::1]/events',
+    'https://service.internal/events',
+    'https://service.local./events',
+    'https://receiver.example:8080/events'
   ])('rejects an invalid callback %s', (url) => {
     expect(
       SubscribeParams.safeParse({ ...params, delivery: { ...params.delivery, url } }).success
@@ -90,7 +96,7 @@ describe('MCP event contract', () => {
       await subscriptionId('user:123', {
         ...params,
         ttlMs: 1000,
-        arguments: { filters: { services: ['my-worker'] }, account_id: accountId },
+        arguments: { afterOccurrences: 1, service: 'my-worker', account_id: accountId },
         delivery: { ...params.delivery, secret: `whsec_${btoa('b'.repeat(32))}` }
       })
     ).toBe(id)
@@ -105,8 +111,8 @@ describe('MCP event contract', () => {
 
   it('grants a finite bounded lifetime, including for requests without expiry', () => {
     expect(subscriptionExpiration(100, 1000)).toBe(1100)
-    expect(subscriptionExpiration(100, null)).toBe(86_400_100)
-    expect(subscriptionExpiration(100, 172_800_000)).toBe(86_400_100)
+    expect(subscriptionExpiration(100, null)).toBe(1_800_100)
+    expect(subscriptionExpiration(100, 172_800_000)).toBe(3_600_100)
     expect(() => subscriptionExpiration(100, -1)).toThrow()
   })
 

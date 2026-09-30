@@ -5,20 +5,60 @@ export const SUPPORTED_ALERT_TYPES: ReadonlySet<string> = new Set([
   'workers_observability_real_time_issue'
 ])
 
-const CallbackUrl = z
+export const CallbackUrl = z
   .string()
+  .max(2048)
   .url()
   .refine((value) => {
     const url = new URL(value)
-    return url.protocol === 'https:' && !url.username && !url.password && !url.hash
-  }, 'Callback must be an HTTPS URL without credentials or a fragment')
+    return (
+      url.protocol === 'https:' &&
+      !url.username &&
+      !url.password &&
+      !url.hash &&
+      (!url.port || url.port === '443') &&
+      url.hostname.includes('.') &&
+      !/^[\d.]+$/.test(url.hostname) &&
+      !url.hostname.includes(':') &&
+      !/(^|\.)(localhost|local|internal|test|invalid|onion)\.?$/.test(url.hostname)
+    )
+  }, 'Callback must use HTTPS on port 443 with a public hostname, without credentials or a fragment')
 
 export const AlertArguments = z
   .object({
-    account_id: z.string().regex(/^[a-f0-9]{32}$/),
-    filters: z.record(z.string(), z.array(z.string())).default({})
+    account_id: z
+      .string()
+      .regex(/^[a-f0-9]{32}$/)
+      .describe('Cloudflare account to monitor'),
+    service: z
+      .string()
+      .trim()
+      .min(1)
+      .max(128)
+      .optional()
+      .describe('Worker name; omit to monitor the account'),
+    afterOccurrences: z
+      .number()
+      .int()
+      .min(1)
+      .max(Number.MAX_SAFE_INTEGER)
+      .optional()
+      .describe('Notify when an issue reaches this occurrence count; use 1 for new issues'),
+    afterInactivitySeconds: z
+      .number()
+      .int()
+      .min(3600)
+      .max(365 * 86400)
+      .optional()
+      .describe(
+        'Notify when an issue recurs after this many inactive seconds; use instead of afterOccurrences'
+      )
   })
   .strict()
+  .refine(
+    (args) => (args.afterOccurrences === undefined) !== (args.afterInactivitySeconds === undefined),
+    'Provide exactly one of afterOccurrences or afterInactivitySeconds'
+  )
 
 export const SubscribeParams = z
   .object({
@@ -118,39 +158,11 @@ export function alertEventDefinitions(catalog: unknown) {
       description: `${alert.display_name}: ${alert.description}`,
       delivery: ['webhook'],
       inputSchema: {
-        type: 'object',
-        properties: {
-          account_id: { type: 'string', pattern: '^[a-f0-9]{32}$' },
-          filters: {
-            type: 'object',
-            properties: Object.fromEntries(
-              alert.filter_options.map((option) => [
-                option.Key,
-                {
-                  type: 'array',
-                  items: {
-                    type: 'string',
-                    ...(option.AvailableValues?.length
-                      ? { enum: option.AvailableValues.map((value) => value.ID) }
-                      : {})
-                  },
-                  ...(option.Range?.startsWith('1-') ? { minItems: 1 } : {})
-                }
-              ])
-            ),
-            required: alert.filter_options
-              .filter((option) => option.Range?.startsWith('1-'))
-              .map((option) => option.Key),
-            additionalProperties: false
-          }
-        },
-        required: [
-          'account_id',
-          ...(alert.filter_options.some((option) => option.Range?.startsWith('1-'))
-            ? ['filters']
-            : [])
-        ],
-        additionalProperties: false
+        ...z.toJSONSchema(AlertArguments),
+        oneOf: [
+          { required: ['afterOccurrences'], not: { required: ['afterInactivitySeconds'] } },
+          { required: ['afterInactivitySeconds'], not: { required: ['afterOccurrences'] } }
+        ]
       },
       payloadSchema: z.toJSONSchema(EventPayloadSchemas[alert.type])
     }))
@@ -219,7 +231,7 @@ export function subscriptionExpiration(now: number, ttlMs?: number | null): numb
   if (ttlMs !== undefined && ttlMs !== null && (!Number.isSafeInteger(ttlMs) || ttlMs <= 0)) {
     throw new Error('Invalid subscription lifetime')
   }
-  return now + Math.min(ttlMs ?? 24 * 60 * 60 * 1000, 24 * 60 * 60 * 1000)
+  return now + Math.min(ttlMs ?? 30 * 60 * 1000, 60 * 60 * 1000)
 }
 
 export async function constantTimeEqual(left: string, right: string): Promise<boolean> {
@@ -293,10 +305,36 @@ export async function verifyCallback(
     ),
     body
   })
-  if (!response.ok) throw new Error('Callback verification failed')
-  const result = z.object({ challenge: z.string() }).parse(await response.json())
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {})
+    throw new Error('Callback verification failed')
+  }
+  const result = z.object({ challenge: z.string() }).parse(await readJson(response, 4096))
   if (!(await constantTimeEqual(challenge, result.challenge))) {
     throw new Error('Callback verification failed')
+  }
+}
+
+export async function readJson(
+  message: Request | Response,
+  limit = MAX_EVENT_BYTES
+): Promise<unknown> {
+  const reader = message.body?.getReader()
+  if (!reader) throw new Error('Missing JSON body')
+  const decoder = new TextDecoder()
+  let text = ''
+  let size = 0
+  try {
+    while (true) {
+      const part = await reader.read()
+      if (part.done) break
+      size += part.value.length
+      if (size > limit) throw new Error('JSON body too large')
+      text += decoder.decode(part.value, { stream: true })
+    }
+    return JSON.parse(text + decoder.decode())
+  } finally {
+    await reader.cancel().catch(() => {})
   }
 }
 
@@ -388,6 +426,7 @@ export async function forwardAnsWebhook(
       headers: await signedHeaders(subscription, eventId, body, now),
       body
     })
+    await response.body?.cancel().catch(() => {})
     if (response.ok) return new Response(null, { status: 204 })
     if (response.status === 410) {
       await dependencies.deactivateSubscription(id)

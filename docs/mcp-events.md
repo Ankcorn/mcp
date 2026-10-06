@@ -1,7 +1,10 @@
 # MCP Events for real-time issues
 
-The authenticated `/mcp` endpoint advertises `events: {}` and implements
-`events/list`, `events/subscribe` and `events/unsubscribe`. The supported event is
+The authenticated `/mcp` endpoint advertises `events: { listChanged: false }` and
+implements webhook delivery from the
+[MCP Events draft](https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md):
+`events/list`, `events/subscribe` and `events/unsubscribe`. Poll and push
+(`events/poll`, `events/stream`) are not offered. The supported event is
 `cloudflare.alert.workers_observability_real_time_issue`.
 
 `events/list` describes event types and argument/payload schemas, not previous
@@ -46,14 +49,16 @@ policy and issue automations. Rotating the encryption key or changing the public
 resource URL requires recreating subscriptions. Do not manually edit managed
 resource names or policy descriptions.
 
-Subscriptions default to 30 minutes, are capped at one hour, and expire before the
-authenticating MCP token. `ttlMs: null` receives a finite lifetime. Clients refresh
+Subscriptions default to 30 minutes and expire before the authenticating MCP token.
+`ttlMs` is clamped to between one minute and one hour, never rejected; `ttlMs: null`
+receives the one-hour maximum. `cursor` and `maxAgeMs` are accepted and ignored. Clients refresh
 before `refreshBefore`. Key rotation dual-signs for five minutes; callback verification
 is cached in the policy for five minutes for the same owner, URL and key.
 
 Expiry stops delivery without a scheduler. Idle expired resources remain in ANS
-until refresh or unsubscribe. Receiver `410` disables the policy. If permissions
-are revoked, an account administrator may need to remove the managed resources.
+until refresh or unsubscribe. If permissions are revoked, the policy is disabled and
+an account administrator may need to remove the managed resources. `terminated` and
+`gap` control envelopes are not sent (ChatGPT does not support them).
 
 ANS creation does not expose atomic create-if-absent. Sequential retries reuse
 resources; overlapping calls within an isolate are serialized. Duplicate managed
@@ -77,12 +82,27 @@ ChatGPT supplies its callback URL and signing secret when the user asks it to
 monitor an event. The server verifies the signed callback challenge before creating
 resources. Refresh and unsubscribe use the original identity and arguments.
 
+## Errors
+
+| Code | When |
+| --- | --- |
+| `-32602` InvalidParams | Arguments, callback URL or `whsec_` secret are invalid |
+| `-32011` NotFound (`data.kind: "event"`) | Unknown event, or not available on the account |
+| `-32012` Forbidden | Missing Cloudflare permissions, another account, or another principal's subscription |
+| `-32015` CallbackEndpointError | Verification failed; `data.reason` is `challenge_failed`, `timeout`, `connection_refused`, `tls_error`, `http_4xx` or `http_5xx` |
+| `-32603` | Cloudflare API failure; retry, partial resources are reused |
+
+`events/unsubscribe` is idempotent and returns `{}` when nothing matches, as ChatGPT
+expects; `delivery.mode` is optional there.
+
 ## Delivery behavior
 
-Each ANS request makes at most one outbound attempt. Network failures, timeouts,
-`408`, `429`, redirects and server errors return `503` for ANS to retry. Other
-permanent callback errors are propagated; `410` disables the policy. Expired,
-disabled, removed or unauthorized subscriptions are acknowledged without forwarding.
+Each ANS request makes at most one outbound attempt. A `2xx` is acknowledged. As
+the draft requires, `410` and `413` are non-retryable for that delivery only: ANS
+gets a `204` and the subscription stays active. Every other outcome (network
+failures, timeouts, redirects, other `4xx` and `5xx`) returns `503` so ANS retries
+with its own backoff. Expired, disabled, removed or unauthorized subscriptions are
+acknowledged without forwarding.
 
 The entire callback path has a four-second deadline, below ANS's five-second default.
 There is no background delivery or second retry scheduler. Event IDs use Vega's

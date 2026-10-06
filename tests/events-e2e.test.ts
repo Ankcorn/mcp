@@ -32,7 +32,7 @@ interface RpcResponse {
     capabilities?: { events?: object }
     events?: unknown[]
   }
-  error?: { code: number }
+  error?: { code: number; data?: Record<string, unknown> }
 }
 const resources = new Map<string, Map<string, Resource>>()
 const requests: Array<{ method: string; path: string }> = []
@@ -287,7 +287,7 @@ describe('MCP Events through the real Worker', () => {
     expect(deliveries).toHaveLength(1)
   })
   it('advertises a catalogue of event types without creating resources', async () => {
-    expect((await rpc('server/discover')).result?.capabilities?.events).toEqual({})
+    expect((await rpc('server/discover')).result?.capabilities?.events).toEqual({ listChanged: false })
     const list = await rpc('events/list')
     expect(list.result?.events).toHaveLength(1)
     expect(requests.every((request) => request.method === 'GET')).toBe(true)
@@ -317,7 +317,8 @@ describe('MCP Events through the real Worker', () => {
       data: { data: { issue: { id: 'issue-1' } } },
       cursor: null
     })
-    const { secret: _secret, ...delivery } = params.delivery
+    // The draft's unsubscribe sends delivery as `{ url }` alone.
+    const delivery = { url: params.delivery.url }
     expect((await rpc('events/unsubscribe', { ...params, delivery })).error).toBeUndefined()
     expect((await rpc('events/unsubscribe', { ...params, delivery })).error).toBeUndefined()
     expect([...resources.values()].every((collection) => collection.size === 0)).toBe(true)
@@ -358,7 +359,9 @@ describe('MCP Events through the real Worker', () => {
 
   it('rejects failed verification before creating ANS resources', async () => {
     rejectVerification = true
-    expect((await rpc('events/subscribe', params)).error?.code).toBe(-32015)
+    const failed = await rpc('events/subscribe', params)
+    expect(failed.error?.code).toBe(-32015)
+    expect(failed.error?.data).toEqual({ reason: 'challenge_failed' })
     expect([...resources.values()].every((collection) => collection.size === 0)).toBe(true)
   })
 
@@ -378,13 +381,14 @@ describe('MCP Events through the real Worker', () => {
     expect(deliveries).toHaveLength(0)
   })
 
-  it('disables the authoritative policy after callback 410', async () => {
+  it('drops a delivery the receiver rejects with 410 but keeps the subscription', async () => {
     await rpc('events/subscribe', params)
     callbackStatus = 410
     expect((await exports.default.fetch(ansRequest())).status).toBe(204)
-    expect([...records(POLICIES).values()][0].enabled).toBe(false)
+    expect([...records(POLICIES).values()][0].enabled).toBe(true)
+    callbackStatus = 204
     expect((await exports.default.fetch(ansRequest())).status).toBe(204)
-    expect(deliveries).toHaveLength(1)
+    expect(deliveries).toHaveLength(2)
   })
 
   it('honors live permission revocation and leaves transient API failures to ANS', async () => {
@@ -436,6 +440,27 @@ describe('MCP Events through the real Worker', () => {
     expect(results[0].result?.id).toBeTruthy()
     expect(results[1].result?.id).toBe(results[0].result?.id)
     expect([...resources.values()].every((collection) => collection.size === 1)).toBe(true)
+  })
+
+  it('accepts the draft subscribe fields and clamps the requested lifetime', async () => {
+    const result = await rpc('events/subscribe', {
+      ...params,
+      cursor: 'opaque-cursor',
+      maxAgeMs: 300_000,
+      ttlMs: 1
+    })
+    expect(result.error).toBeUndefined()
+    expect(result.result).toMatchObject({ cursor: null, truncated: false })
+  })
+
+  it('answers unknown events with NotFound before provisioning', async () => {
+    const result = await rpc('events/subscribe', {
+      ...params,
+      name: 'cloudflare.alert.http_alert_origin_error'
+    })
+    expect(result.error?.code).toBe(-32011)
+    expect(result.error?.data).toEqual({ kind: 'event' })
+    expect([...resources.values()].every((collection) => collection.size === 0)).toBe(true)
   })
 
   it('rejects invalid trigger combinations before provisioning', async () => {

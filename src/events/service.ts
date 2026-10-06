@@ -7,10 +7,12 @@ import {
   SubscribeParams,
   UnsubscribeParams,
   alertEventDefinitions,
+  isSupportedEventName,
   readJson,
   subscriptionExpiration,
   subscriptionId,
   verifyCallback,
+  type CallbackFailureReason,
   type Subscription
 } from './ans-bridge'
 import {
@@ -43,9 +45,30 @@ async function serialized<T>(id: string, operation: () => Promise<T>): Promise<T
   }
 }
 
+/** The callback endpoint failed the verification handshake (`-32015`). */
 export class CallbackError extends Error {
+  readonly _tag = 'CallbackError' as const
+
+  constructor(readonly reason: CallbackFailureReason) {
+    super('Callback endpoint verification failed')
+  }
+}
+
+/** The event is not offered to this principal, or not offered at all (`-32011`). */
+export class EventNotFound extends Error {
+  readonly _tag = 'EventNotFound' as const
+
+  constructor(readonly eventName: string) {
+    super(`Unknown event: ${eventName}`)
+  }
+}
+
+/** The subscription key belongs to a different principal (`-32012`). */
+export class SubscriptionForbidden extends Error {
+  readonly _tag = 'SubscriptionForbidden' as const
+
   constructor() {
-    super('Callback verification failed')
+    super('This subscription belongs to a different principal')
   }
 }
 
@@ -162,6 +185,7 @@ export class EventService {
 
   async subscribe(input: unknown) {
     const params = SubscribeParams.parse(input)
+    if (!isSupportedEventName(params.name)) throw new EventNotFound(params.name)
     const id = await subscriptionId(`${this.env.MCP_RESOURCE}:${this.principal}`, params)
     return serialized(id, async () => {
       if (
@@ -169,7 +193,7 @@ export class EventService {
           (event) => event.name === params.name
         )
       )
-        throw new EventApiError(404)
+        throw new EventNotFound(params.name)
       const api = this.api(params.arguments.account_id)
       const name = managedName(id)
       const policyId = await api.find(POLICIES, name)
@@ -179,7 +203,7 @@ export class EventService {
       const previous = previousPolicy
         ? await readPolicyState(this.env, previousPolicy, id)
         : undefined
-      if (previous && previous.principal !== this.principal) throw new EventApiError(403)
+      if (previous && previous.principal !== this.principal) throw new SubscriptionForbidden()
       const credential = await credentialInfo(this.env, this.bearer)
       const now = Date.now()
       const expiresAt = Math.min(
@@ -201,26 +225,23 @@ export class EventService {
         previous.params.delivery.secret !== params.delivery.secret ||
         state.verifiedUntil <= now
       ) {
-        try {
-          await verifyCallback(
-            asSubscription(
-              state,
-              {
-                id: '',
-                name,
-                description: '',
-                enabled: false,
-                alert_type: params.name.slice('cloudflare.alert.'.length),
-                mechanisms: { webhooks: [] }
-              },
-              ''
-            ),
-            publicWebhookFetch,
-            now
-          )
-        } catch {
-          throw new CallbackError()
-        }
+        const verification = await verifyCallback(
+          asSubscription(
+            state,
+            {
+              id: '',
+              name,
+              description: '',
+              enabled: false,
+              alert_type: params.name.slice('cloudflare.alert.'.length),
+              mechanisms: { webhooks: [] }
+            },
+            ''
+          ),
+          publicWebhookFetch,
+          now
+        )
+        if (verification._tag === 'failed') throw new CallbackError(verification.reason)
         state.verifiedUntil = now + 5 * 60_000
       }
       if (previous && previous.params.delivery.secret !== params.delivery.secret) {
@@ -289,6 +310,7 @@ export class EventService {
 
   async unsubscribe(input: unknown) {
     const params = UnsubscribeParams.parse(input)
+    if (!isSupportedEventName(params.name)) throw new EventNotFound(params.name)
     const id = await subscriptionId(`${this.env.MCP_RESOURCE}:${this.principal}`, params)
     return serialized(id, async () => {
       const api = this.api(params.arguments.account_id)
@@ -299,7 +321,7 @@ export class EventService {
           await api.result(`${POLICIES}/${encodeURIComponent(policyId)}`)
         )
         const state = await readPolicyState(this.env, policy, id)
-        if (state.principal !== this.principal) throw new EventApiError(403)
+        if (state.principal !== this.principal) throw new SubscriptionForbidden()
         const { id: _policyId, ...body } = policy
         await api.result(`${POLICIES}/${encodeURIComponent(policyId)}`, 'PUT', {
           ...body,

@@ -3,7 +3,9 @@ import {
   MAX_EVENT_BYTES,
   alertEventDefinitions,
   SubscribeParams,
+  UnsubscribeParams,
   forwardAnsWebhook,
+  isSupportedEventName,
   signedHeaders,
   subscriptionExpiration,
   subscriptionId,
@@ -109,11 +111,28 @@ describe('MCP event contract', () => {
     ).toBe(id)
   })
 
-  it('grants a finite bounded lifetime, including for requests without expiry', () => {
-    expect(subscriptionExpiration(100, 1000)).toBe(1100)
-    expect(subscriptionExpiration(100, null)).toBe(1_800_100)
+  it('grants a finite bounded lifetime, clamping instead of rejecting', () => {
+    expect(subscriptionExpiration(100, 600_000)).toBe(600_100)
+    expect(subscriptionExpiration(100)).toBe(1_800_100)
+    expect(subscriptionExpiration(100, null)).toBe(3_600_100)
     expect(subscriptionExpiration(100, 172_800_000)).toBe(3_600_100)
-    expect(() => subscriptionExpiration(100, -1)).toThrow()
+    expect(subscriptionExpiration(100, 1000)).toBe(60_100)
+    expect(subscriptionExpiration(100, -1)).toBe(60_100)
+    expect(subscriptionExpiration(100, Number.POSITIVE_INFINITY)).toBe(3_600_100)
+  })
+
+  it('accepts the draft fields for events without replay', () => {
+    expect(
+      SubscribeParams.safeParse({ ...params, cursor: 'opaque', maxAgeMs: 300_000, ttlMs: 0 })
+        .success
+    ).toBe(true)
+    expect(
+      UnsubscribeParams.safeParse({
+        name: params.name,
+        arguments: params.arguments,
+        delivery: { url: params.delivery.url }
+      }).success
+    ).toBe(true)
   })
 
   it('matches an independently calculated Standard Webhooks signature', async () => {
@@ -149,14 +168,35 @@ describe('MCP event contract', () => {
     })
     await expect(
       verifyCallback(subscription, transport as unknown as typeof fetch, 100_000)
-    ).resolves.toBeUndefined()
+    ).resolves.toEqual({ _tag: 'verified' })
   })
 
   it('rejects a callback that does not echo the challenge', async () => {
     const transport = vi.fn(async () => Response.json({ challenge: 'wrong' }))
     await expect(
       verifyCallback(subscription, transport as unknown as typeof fetch, 100_000)
-    ).rejects.toThrow()
+    ).resolves.toEqual({ _tag: 'failed', reason: 'challenge_failed' })
+  })
+
+  it.each([
+    [async () => new Response(null, { status: 404 }), 'http_4xx'],
+    [async () => new Response(null, { status: 502 }), 'http_5xx'],
+    [
+      async () => {
+        throw new DOMException('timed out', 'TimeoutError')
+      },
+      'timeout'
+    ],
+    [
+      async () => {
+        throw new TypeError('Network connection lost')
+      },
+      'connection_refused'
+    ]
+  ])('categorizes callback verification failures', async (transport, reason) => {
+    await expect(
+      verifyCallback(subscription, transport as unknown as typeof fetch, 100_000)
+    ).resolves.toEqual({ _tag: 'failed', reason })
   })
 })
 
@@ -210,10 +250,8 @@ describe('ANS synchronous delivery bridge', () => {
     }
     expect((await forwardAnsWebhook(request(notification), subscription.id, deps)).status).toBe(403)
     expect(deps.webhookFetch).not.toHaveBeenCalled()
-    expect(
-      SubscribeParams.safeParse({ ...params, name: 'cloudflare.alert.http_alert_origin_error' })
-        .success
-    ).toBe(false)
+    expect(isSupportedEventName('cloudflare.alert.http_alert_origin_error')).toBe(false)
+    expect(isSupportedEventName(params.name)).toBe(true)
   })
 
   it.each([
@@ -224,8 +262,10 @@ describe('ANS synchronous delivery bridge', () => {
     [500, 503],
     [502, 503],
     [302, 503],
-    [401, 401],
-    [413, 413]
+    [401, 503],
+    [404, 503],
+    [410, 204],
+    [413, 204]
   ])('maps callback status %i to ANS status %i', async (callbackStatus, ansStatus) => {
     expect(
       (await forwardAnsWebhook(request(), subscription.id, dependencies(callbackStatus))).status
@@ -324,7 +364,7 @@ describe('ANS synchronous delivery bridge', () => {
     }
   })
 
-  it('deactivates subscriptions on revoked access or callback 410', async () => {
+  it('deactivates subscriptions on revoked access, but not on a callback 410', async () => {
     const revoked = dependencies()
     revoked.hasAccess = vi.fn(async () => false)
     expect((await forwardAnsWebhook(request(), subscription.id, revoked)).status).toBe(204)
@@ -332,7 +372,7 @@ describe('ANS synchronous delivery bridge', () => {
     expect(revoked.deactivateSubscription).toHaveBeenCalledWith(subscription.id)
     const gone = dependencies(410)
     expect((await forwardAnsWebhook(request(), subscription.id, gone)).status).toBe(204)
-    expect(gone.deactivateSubscription).toHaveBeenCalledWith(subscription.id)
+    expect(gone.deactivateSubscription).not.toHaveBeenCalled()
   })
 
   it('returns a retryable status for network failures', async () => {

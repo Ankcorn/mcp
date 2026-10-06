@@ -60,19 +60,31 @@ export const AlertArguments = z
     'Provide exactly one of afterOccurrences or afterInactivitySeconds'
   )
 
+/**
+ * Event names this server offers. Unknown names are not invalid parameters;
+ * the methods answer them with `-32011 NotFound` (`data.kind: "event"`).
+ */
+const EventName = z.string().regex(/^cloudflare\.alert\.[a-z][a-z0-9_]*$/)
+
+/** `true` when the event name is in the catalogue this server implements. */
+export function isSupportedEventName(name: string): boolean {
+  return SUPPORTED_ALERT_TYPES.has(name.slice('cloudflare.alert.'.length))
+}
+
+const WebhookMode = z.literal('webhook')
+
+/**
+ * `events/subscribe` params. Follows the MCP Events draft: `cursor` and
+ * `maxAgeMs` are accepted and ignored because these events have no replay
+ * (`cursor: null`), and any `ttlMs` is clamped rather than rejected.
+ */
 export const SubscribeParams = z
   .object({
-    name: z
-      .string()
-      .regex(/^cloudflare\.alert\.[a-z][a-z0-9_]*$/)
-      .refine(
-        (name) => SUPPORTED_ALERT_TYPES.has(name.slice('cloudflare.alert.'.length)),
-        'Event is not in the supported MCP catalogue'
-      ),
+    name: EventName,
     arguments: AlertArguments,
     delivery: z
       .object({
-        mode: z.literal('webhook'),
+        mode: WebhookMode,
         url: CallbackUrl,
         secret: z.string().refine((value) => {
           try {
@@ -84,14 +96,24 @@ export const SubscribeParams = z
         }, 'Expected whsec_ with a base64-encoded 24–64 byte key')
       })
       .strict(),
-    cursor: z.null().optional(),
-    ttlMs: z.number().int().positive().nullable().optional()
+    cursor: z.string().nullable().optional(),
+    maxAgeMs: z.number().int().nonnegative().optional(),
+    ttlMs: z.number().nullable().optional()
   })
   .strict()
 
-export const UnsubscribeParams = SubscribeParams.omit({ ttlMs: true }).extend({
-  delivery: SubscribeParams.shape.delivery.omit({ secret: true })
-})
+/**
+ * `events/unsubscribe` params. The subscription key is `(principal, url, name,
+ * arguments)`; the draft's example sends `delivery` as `{ url }` alone, so
+ * `mode` is optional here.
+ */
+export const UnsubscribeParams = z
+  .object({
+    name: EventName,
+    arguments: AlertArguments,
+    delivery: z.object({ mode: WebhookMode.optional(), url: CallbackUrl }).strict()
+  })
+  .strict()
 
 export const AvailableAlert = z.object({
   type: z.string().regex(/^[a-z][a-z0-9_]*$/),
@@ -227,11 +249,25 @@ export async function subscriptionId(principal: string, input: unknown): Promise
   )}`
 }
 
+const DEFAULT_TTL_MS = 30 * 60 * 1000
+const MIN_TTL_MS = 60 * 1000
+const MAX_TTL_MS = 60 * 60 * 1000
+
+/**
+ * Grant a subscription lifetime from the client's `ttlMs` suggestion.
+ *
+ * The draft gives TTLs no rejection path: an omitted suggestion gets the
+ * default, `null` (no expiry) and anything too long are clamped to the
+ * maximum, and anything too short is clamped up to the floor.
+ *
+ * @param now - Current time in Unix milliseconds.
+ * @param ttlMs - The client's suggested lifetime.
+ * @returns The expiry time in Unix milliseconds.
+ */
 export function subscriptionExpiration(now: number, ttlMs?: number | null): number {
-  if (ttlMs !== undefined && ttlMs !== null && (!Number.isSafeInteger(ttlMs) || ttlMs <= 0)) {
-    throw new Error('Invalid subscription lifetime')
-  }
-  return now + Math.min(ttlMs ?? 30 * 60 * 1000, 60 * 60 * 1000)
+  const suggested = ttlMs === undefined ? DEFAULT_TTL_MS : (ttlMs ?? MAX_TTL_MS)
+  const granted = Number.isFinite(suggested) ? suggested : MAX_TTL_MS
+  return now + Math.min(Math.max(granted, MIN_TTL_MS), MAX_TTL_MS)
 }
 
 export async function constantTimeEqual(left: string, right: string): Promise<boolean> {
@@ -285,34 +321,87 @@ export async function signedHeaders(
   })
 }
 
+/**
+ * Why a callback endpoint failed verification. These are the draft's
+ * `lastError` categories; raw endpoint responses are never surfaced.
+ */
+export type CallbackFailureReason =
+  | 'connection_refused'
+  | 'timeout'
+  | 'tls_error'
+  | 'http_4xx'
+  | 'http_5xx'
+  | 'challenge_failed'
+
+/** Outcome of the callback verification handshake. */
+export type CallbackVerification =
+  | { readonly _tag: 'verified' }
+  | { readonly _tag: 'failed'; readonly reason: CallbackFailureReason }
+
+function transportFailureReason(error: unknown): CallbackFailureReason {
+  if (
+    error instanceof DOMException &&
+    (error.name === 'TimeoutError' || error.name === 'AbortError')
+  )
+    return 'timeout'
+  const message = error instanceof Error ? error.message.toLowerCase() : ''
+  if (/tls|ssl|certificate/.test(message)) return 'tls_error'
+  return 'connection_refused'
+}
+
+/**
+ * Run the draft's endpoint-verification handshake: POST a signed
+ * `verification` envelope and require the endpoint to echo the challenge in a
+ * 2xx body, compared in constant time.
+ *
+ * @param subscription - The subscription whose callback URL and secret to use.
+ * @param webhookFetch - Fetch restricted to public callback URLs.
+ * @param now - Current time in Unix milliseconds, used for the signature.
+ * @returns `verified`, or `failed` with the draft's failure category.
+ */
 export async function verifyCallback(
   subscription: Subscription,
   webhookFetch: typeof fetch,
   now: number
-): Promise<void> {
-  CallbackUrl.parse(subscription.callbackUrl)
+): Promise<CallbackVerification> {
+  if (!CallbackUrl.safeParse(subscription.callbackUrl).success)
+    return { _tag: 'failed', reason: 'connection_refused' }
   const challenge = crypto.randomUUID()
   const body = JSON.stringify({ type: 'verification', challenge })
-  const response = await webhookFetch(subscription.callbackUrl, {
-    method: 'POST',
-    redirect: 'error',
-    signal: AbortSignal.timeout(10_000),
-    headers: await signedHeaders(
-      subscription,
-      `msg_verification_${crypto.randomUUID()}`,
-      body,
-      now
-    ),
-    body
-  })
+  let response: Response
+  try {
+    response = await webhookFetch(subscription.callbackUrl, {
+      method: 'POST',
+      redirect: 'error',
+      signal: AbortSignal.timeout(10_000),
+      headers: await signedHeaders(
+        subscription,
+        `msg_verification_${crypto.randomUUID()}`,
+        body,
+        now
+      ),
+      body
+    })
+  } catch (error) {
+    return { _tag: 'failed', reason: transportFailureReason(error) }
+  }
   if (!response.ok) {
     await response.body?.cancel().catch(() => {})
-    throw new Error('Callback verification failed')
+    if (response.status >= 500) return { _tag: 'failed', reason: 'http_5xx' }
+    if (response.status >= 400) return { _tag: 'failed', reason: 'http_4xx' }
+    // A 3xx under manual redirects: the endpoint did not accept the challenge.
+    return { _tag: 'failed', reason: 'challenge_failed' }
   }
-  const result = z.object({ challenge: z.string() }).parse(await readJson(response, 4096))
-  if (!(await constantTimeEqual(challenge, result.challenge))) {
-    throw new Error('Callback verification failed')
+  let echoed: unknown
+  try {
+    echoed = await readJson(response, 4096)
+  } catch {
+    return { _tag: 'failed', reason: 'challenge_failed' }
   }
+  const result = z.object({ challenge: z.string() }).safeParse(echoed)
+  if (!result.success || !(await constantTimeEqual(challenge, result.data.challenge)))
+    return { _tag: 'failed', reason: 'challenge_failed' }
+  return { _tag: 'verified' }
 }
 
 export async function readJson(
@@ -428,19 +517,14 @@ export async function forwardAnsWebhook(
     })
     await response.body?.cancel().catch(() => {})
     if (response.ok) return new Response(null, { status: 204 })
-    if (response.status === 410) {
-      await dependencies.deactivateSubscription(id)
+    // The draft makes 410 and 413 non-retryable for this delivery only; the
+    // subscription itself stays active. Acknowledge so ANS does not retry.
+    if (response.status === 410 || response.status === 413) {
       return new Response(null, { status: 204 })
     }
-    if (
-      response.status === 408 ||
-      response.status === 429 ||
-      response.status >= 500 ||
-      response.status < 400
-    ) {
-      return new Response(null, { status: 503 })
-    }
-    return new Response(null, { status: response.status })
+    // Every other non-2xx (including redirects, which are never followed) is
+    // retried. ANS owns retries, with backoff and bounded attempts.
+    return new Response(null, { status: 503 })
   } catch {
     return new Response(null, { status: 503 })
   }

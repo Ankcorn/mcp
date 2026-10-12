@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import type { AuthProps } from '../auth/types'
+import { USER_AGENT } from '../constants'
 import { fetchWithRetry } from '../utils/fetch-retry'
 import { EventApi, EventApiError, AUTOMATIONS, POLICIES, WEBHOOKS } from './api'
 import {
@@ -72,10 +73,16 @@ export class SubscriptionForbidden extends Error {
   }
 }
 
+/**
+ * Fetch for client callback URLs: re-checks the URL, never follows redirects,
+ * and identifies this server with the shared `User-Agent`.
+ */
 export const publicWebhookFetch: typeof fetch = async (input, init) => {
   const url = input instanceof Request ? input.url : String(input)
   CallbackUrl.parse(url)
-  return fetch(url, { ...init, redirect: 'manual' })
+  const headers = new Headers(init?.headers)
+  headers.set('User-Agent', USER_AGENT)
+  return fetch(url, { ...init, headers, redirect: 'manual' })
 }
 
 export function asSubscription(

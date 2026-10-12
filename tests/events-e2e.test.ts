@@ -29,7 +29,7 @@ interface RpcResponse {
   result?: {
     id?: string
     refreshBefore?: string
-    capabilities?: { events?: object }
+    capabilities?: { events?: object; extensions?: Record<string, unknown> }
     events?: unknown[]
   }
   error?: { code: number; data?: Record<string, unknown> }
@@ -136,6 +136,7 @@ beforeEach(async () => {
     http.post(callbackUrl, async ({ request }) => {
       const body = await request.text()
       await checkSignature(request, body)
+      expect(request.headers.get('User-Agent')).toBe(USER_AGENT)
       const value = JSON.parse(body)
       if (value.type === 'verification') {
         verificationCount++
@@ -287,7 +288,9 @@ describe('MCP Events through the real Worker', () => {
     expect(deliveries).toHaveLength(1)
   })
   it('advertises a catalogue of event types without creating resources', async () => {
-    expect((await rpc('server/discover')).result?.capabilities?.events).toEqual({ listChanged: false })
+    const capabilities = (await rpc('server/discover')).result?.capabilities
+    expect(capabilities?.events).toEqual({ listChanged: false })
+    expect(capabilities?.extensions).toHaveProperty(['io.modelcontextprotocol/skills'])
     const list = await rpc('events/list')
     expect(list.result?.events).toHaveLength(1)
     expect(requests.every((request) => request.method === 'GET')).toBe(true)

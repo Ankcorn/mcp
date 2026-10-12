@@ -75,8 +75,9 @@ Provide `account_id`, optional Worker `service`, and exactly one trigger:
 
 These are Vega settings, not ANS policy filters. Issue automations must be enabled
 for the account. Credentials must allow reading and managing notification
-policies/destinations and Workers Observability issue automations. Read-only OAuth
-consent is insufficient for subscribing.
+policies/destinations and Workers Observability issue automations. The consent page
+defaults to read-only scopes, so OAuth users must add `notifications.write` and
+`workers-observability.write` there before subscribing.
 
 ChatGPT supplies its callback URL and signing secret when the user asks it to
 monitor an event. The server verifies the signed callback challenge before creating

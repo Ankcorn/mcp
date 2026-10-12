@@ -309,6 +309,13 @@ describe('ANS synchronous delivery bridge', () => {
     expect(first.redirect).toBe('error')
   })
 
+  it('forwards a real Workers issue alert, which carries no account_id', async () => {
+    const { account_id: _account, ...issueAlert } = alert
+    const deps = dependencies()
+    expect((await forwardAnsWebhook(request(issueAlert), subscription.id, deps)).status).toBe(204)
+    expect(deps.webhookFetch).toHaveBeenCalledOnce()
+  })
+
   it('requires the ANS ingress secret and account/policy/alert-type scope', async () => {
     const deps = dependencies()
     expect((await forwardAnsWebhook(request(alert, 'wrong'), subscription.id, deps)).status).toBe(

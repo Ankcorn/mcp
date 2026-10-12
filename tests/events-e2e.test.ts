@@ -88,16 +88,38 @@ function ansRequest(destination = [...records(WEBHOOKS).values()][0], overrides 
   return new Request(destination.url as string, {
     method: 'POST',
     headers: { 'cf-webhook-auth': destination.secret as string },
+    // The shape of a real Workers issue alert from ANS (2026-10-12). It has no
+    // account_id; the policy ID binds it to the account.
     body: JSON.stringify({
       name: destination.name,
       text: 'Checkout issue',
-      account_id: accountId,
-      policy_id: policy?.id ?? 'deleted',
-      alert_type: 'workers_observability_real_time_issue',
-      alert_correlation_id: 'vega-persisted-run-1',
       ts: 1_800_000_000,
+      policy_id: policy?.id ?? 'deleted',
+      policy_name: destination.name,
+      alert_type: 'workers_observability_real_time_issue',
+      alert_event: 'ALERT_STATE_EVENT_START',
+      alert_correlation_id: 'vega-persisted-run-1',
       data: {
-        issue: { id: 'issue-1', services: [{ name: 'checkout' }], title: 'Unhandled exception' }
+        issue: {
+          id: 'issue-1',
+          fingerprint: 'fp-1',
+          title: 'Unhandled exception',
+          type: 'exception',
+          status: 'active',
+          count: '9',
+          first_observed: '2026-10-12T16:00:00Z',
+          last_observed: '2026-10-12T16:05:00Z',
+          services: [
+            {
+              name: 'checkout',
+              type: 'worker',
+              first_observed: '2026-10-12T16:00:00Z',
+              last_observed: '2026-10-12T16:05:00Z'
+            }
+          ]
+        },
+        state_correlation_id: 'state-1',
+        state_event: 'ALERT_STATE_EVENT_START'
       },
       ...overrides
     })

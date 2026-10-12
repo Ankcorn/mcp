@@ -140,7 +140,8 @@ export const AvailableAlert = z.object({
 export const AlertPayload = z.object({
   name: z.string(),
   text: z.string(),
-  account_id: z.string(),
+  // Absent from Workers issue alerts; checked only when present.
+  account_id: z.string().optional(),
   account_name: z.string().optional(),
   policy_id: z.string(),
   policy_name: z.string().optional(),
@@ -434,6 +435,17 @@ export async function readJson(
   }
 }
 
+/** Key names and value types of a JSON value, without the values themselves. */
+function payloadShape(value: unknown, depth = 0): unknown {
+  if (depth > 4) return '…'
+  if (Array.isArray(value)) return value.length ? [payloadShape(value[0], depth + 1)] : []
+  if (value !== null && typeof value === 'object')
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, payloadShape(entry, depth + 1)])
+    )
+  return value === null ? 'null' : typeof value
+}
+
 export async function forwardAnsWebhook(
   request: Request,
   id: string,
@@ -484,15 +496,32 @@ export async function forwardAnsWebhook(
     offset += chunk.length
   }
   const input = new TextDecoder().decode(bytes)
-  let alert: z.infer<typeof AlertPayload>
+  let raw: unknown
   try {
-    alert = (EventPayloadSchemas[subscription.alertType] ?? AlertPayload).parse(JSON.parse(input))
+    raw = JSON.parse(input)
   } catch {
     return new Response(null, { status: 400 })
   }
+  const parsed = (EventPayloadSchemas[subscription.alertType] ?? AlertPayload).safeParse(raw)
+  if (!parsed.success) {
+    // Shape and failing paths only: alert values can hold customer data.
+    console.log(
+      JSON.stringify({
+        event: 'mcp_events_payload_rejected',
+        subscription: subscription.id,
+        issues: parsed.error.issues.map((issue) => ({
+          path: issue.path.join('.'),
+          code: issue.code
+        })),
+        shape: payloadShape(raw)
+      })
+    )
+    return new Response(null, { status: 400 })
+  }
+  const alert = parsed.data
   if (
     !SUPPORTED_ALERT_TYPES.has(subscription.alertType) ||
-    alert.account_id !== subscription.accountId ||
+    (alert.account_id !== undefined && alert.account_id !== subscription.accountId) ||
     alert.policy_id !== subscription.policyId ||
     alert.alert_type !== subscription.alertType
   ) {

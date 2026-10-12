@@ -292,7 +292,12 @@ export class EventService {
         mechanisms: { webhooks: [{ id: state.webhookId }] }
       }
       const resolvedPolicyId = policyId ?? (await api.create(POLICIES, policyBody))
-      const { account_id: _accountId, ...trigger } = params.arguments
+      const { account_id: _accountId, ...options } = params.arguments
+      // With no trigger given, notify on new issues (first occurrence).
+      const trigger =
+        options.afterInactivitySeconds === undefined
+          ? { ...options, afterOccurrences: options.afterOccurrences ?? 1 }
+          : options
       const automationBody = { ...trigger, name, policyId: resolvedPolicyId, enabled: false }
       const automationId =
         (await api.find(AUTOMATIONS, name, AUTOMATIONS_LISTING)) ??

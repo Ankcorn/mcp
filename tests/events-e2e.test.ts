@@ -474,9 +474,26 @@ describe('MCP Events through the real Worker', () => {
     expect([...resources.values()].every((collection) => collection.size === 0)).toBe(true)
   })
 
+  it('describes the event with a schema ChatGPT accepts', async () => {
+    const list = await rpc('events/list')
+    const [event] = (list.result?.events ?? []) as Array<{
+      inputSchema: Record<string, unknown>
+      payloadSchema: Record<string, unknown>
+    }>
+    for (const schema of [event.inputSchema, event.payloadSchema]) {
+      expect(schema.type).toBe('object')
+      for (const key of ['$schema', 'oneOf', 'anyOf', 'allOf', 'not']) expect(schema).not.toHaveProperty(key)
+    }
+  })
+
+  it('notifies on new issues when no trigger is given', async () => {
+    const { afterOccurrences: _trigger, ...args } = params.arguments
+    expect((await rpc('events/subscribe', { ...params, arguments: args })).error).toBeUndefined()
+    expect([...records(AUTOMATIONS).values()][0]).toMatchObject({ afterOccurrences: 1 })
+  })
+
   it('rejects invalid trigger combinations before provisioning', async () => {
     for (const args of [
-      { account_id: accountId },
       { ...params.arguments, afterInactivitySeconds: 3600 },
       { account_id: accountId, filters: { services: ['checkout'] } }
     ]) {

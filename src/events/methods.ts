@@ -72,7 +72,18 @@ export function registerEventMethods(
         })
         .strict()
     },
-    (params) => operation(() => service.list(params.cursor))
+    async (params) => {
+      const result = await operation(() => service.list(params.cursor))
+      console.log(
+        JSON.stringify({
+          event: 'mcp_events_list',
+          principal: props.type,
+          events: result.events.length,
+          nextCursor: 'nextCursor' in result
+        })
+      )
+      return result
+    }
   )
   server.server.setRequestHandler(
     'events/subscribe',

@@ -3,6 +3,34 @@ import { forwardAnsWebhook } from './ans-bridge'
 import { ManagedPolicy, asSubscription, publicWebhookFetch, readPolicyState } from './service'
 import { DeliveryTicket, decryptState, deliveryAccessToken, type EventEnvironment } from './state'
 
+/**
+ * Why a callback from ANS was acknowledged, dropped or bounced. Logged once
+ * per callback with safe fields only, so silent 204s can be told apart.
+ */
+type CallbackOutcome =
+  | 'bootstrap_probe'
+  | 'ticket_expired'
+  | 'credential_unavailable'
+  | 'access_denied'
+  | 'account_mismatch'
+  | 'forwarded'
+  | 'upstream_error'
+
+function logOutcome(
+  subscription: string,
+  outcome: CallbackOutcome,
+  status: number,
+  detail: Record<string, unknown> = {}
+): void {
+  console.log(
+    JSON.stringify({ event: 'mcp_events_callback', subscription, outcome, status, ...detail })
+  )
+}
+
+/**
+ * Receive an ANS webhook for one subscription, re-check access and forward it
+ * to the subscriber as a signed MCP event.
+ */
 export async function handleAnsCallback(
   request: Request,
   env: EventEnvironment
@@ -20,10 +48,20 @@ export async function handleAnsCallback(
   } catch {
     return new Response(null, { status: 401 })
   }
-  if (ticket.expiresAt <= Date.now() || !ticket.policyId) return new Response(null, { status: 204 })
+  if (!ticket.policyId) {
+    logOutcome(id, 'bootstrap_probe', 204)
+    return new Response(null, { status: 204 })
+  }
+  if (ticket.expiresAt <= Date.now()) {
+    logOutcome(id, 'ticket_expired', 204, { expiredAt: new Date(ticket.expiresAt).toISOString() })
+    return new Response(null, { status: 204 })
+  }
   try {
     const accessToken = await deliveryAccessToken(env, ticket)
-    if (!accessToken) return new Response(null, { status: 204 })
+    if (!accessToken) {
+      logOutcome(id, 'credential_unavailable', 204, { providerIssued: ticket.providerIssued })
+      return new Response(null, { status: 204 })
+    }
     const api = new EventApi(env.CLOUDFLARE_API_BASE, accessToken, ticket.accountId, deadline)
     const [policyData] = await Promise.all([
       api.result(`${POLICIES}/${encodeURIComponent(ticket.policyId)}`),
@@ -31,10 +69,13 @@ export async function handleAnsCallback(
     ])
     const policy = ManagedPolicy.parse(policyData)
     const state = await readPolicyState(env, policy, id)
-    if (state.params.arguments.account_id !== ticket.accountId)
+    if (state.params.arguments.account_id !== ticket.accountId) {
+      logOutcome(id, 'account_mismatch', 403)
       return new Response(null, { status: 403 })
-    return await forwardAnsWebhook(request, id, {
-      loadSubscription: async () => asSubscription(state, policy, secret),
+    }
+    const subscription = asSubscription(state, policy, secret)
+    const response = await forwardAnsWebhook(request, id, {
+      loadSubscription: async () => subscription,
       hasAccess: async () => true,
       eventIdentity: async (_subscription, payload) => payload.alert_correlation_id ?? '',
       now: Date.now,
@@ -47,9 +88,19 @@ export async function handleAnsCallback(
         })
       }
     })
+    logOutcome(id, 'forwarded', response.status, {
+      active: subscription.active,
+      expiresAt: new Date(subscription.expiresAt).toISOString()
+    })
+    return response
   } catch (error) {
-    if (error instanceof EventApiError && [401, 403, 404].includes(error.status))
+    if (error instanceof EventApiError && [401, 403, 404].includes(error.status)) {
+      logOutcome(id, 'access_denied', 204, { upstreamStatus: error.status })
       return new Response(null, { status: 204 })
+    }
+    logOutcome(id, 'upstream_error', 503, {
+      error: error instanceof Error ? error.name : 'unknown'
+    })
     return new Response(null, { status: 503 })
   }
 }

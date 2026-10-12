@@ -43,7 +43,9 @@ export const AlertArguments = z
       .min(1)
       .max(Number.MAX_SAFE_INTEGER)
       .optional()
-      .describe('Notify when an issue reaches this occurrence count; use 1 for new issues'),
+      .describe(
+        'Notify when an issue reaches this occurrence count. Defaults to 1 (new issues). Do not combine with afterInactivitySeconds.'
+      ),
     afterInactivitySeconds: z
       .number()
       .int()
@@ -51,13 +53,13 @@ export const AlertArguments = z
       .max(365 * 86400)
       .optional()
       .describe(
-        'Notify when an issue recurs after this many inactive seconds; use instead of afterOccurrences'
+        'Instead of afterOccurrences: notify when an issue recurs after this many inactive seconds'
       )
   })
   .strict()
   .refine(
-    (args) => (args.afterOccurrences === undefined) !== (args.afterInactivitySeconds === undefined),
-    'Provide exactly one of afterOccurrences or afterInactivitySeconds'
+    (args) => args.afterOccurrences === undefined || args.afterInactivitySeconds === undefined,
+    'Provide at most one of afterOccurrences or afterInactivitySeconds'
   )
 
 /**
@@ -170,6 +172,17 @@ const EventPayloadSchemas: Readonly<Record<string, z.ZodType<NotificationPayload
   workers_observability_real_time_issue: IssueNotificationPayload
 }
 
+/**
+ * JSON Schema for an event descriptor, in the subset ChatGPT accepts for tool
+ * parameters: a plain object schema with no `$schema` and no top-level
+ * `oneOf`/`anyOf`/`not`. ChatGPT drops events whose schema it cannot use.
+ * The "at most one trigger" rule is enforced by `AlertArguments` instead.
+ */
+function descriptorSchema(schema: z.ZodType): Record<string, unknown> {
+  const { $schema: _dialect, ...rest } = z.toJSONSchema(schema)
+  return rest
+}
+
 export function alertEventDefinitions(catalog: unknown) {
   const groups = z.record(z.string(), z.array(AvailableAlert)).parse(catalog)
   return Object.values(groups)
@@ -179,14 +192,8 @@ export function alertEventDefinitions(catalog: unknown) {
       name: `cloudflare.alert.${alert.type}`,
       description: `${alert.display_name}: ${alert.description}`,
       delivery: ['webhook'],
-      inputSchema: {
-        ...z.toJSONSchema(AlertArguments),
-        oneOf: [
-          { required: ['afterOccurrences'], not: { required: ['afterInactivitySeconds'] } },
-          { required: ['afterInactivitySeconds'], not: { required: ['afterOccurrences'] } }
-        ]
-      },
-      payloadSchema: z.toJSONSchema(EventPayloadSchemas[alert.type])
+      inputSchema: descriptorSchema(AlertArguments),
+      payloadSchema: descriptorSchema(EventPayloadSchemas[alert.type])
     }))
 }
 

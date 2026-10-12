@@ -2,7 +2,14 @@ import { z } from 'zod'
 import type { AuthProps } from '../auth/types'
 import { USER_AGENT } from '../constants'
 import { fetchWithRetry } from '../utils/fetch-retry'
-import { EventApi, EventApiError, AUTOMATIONS, POLICIES, WEBHOOKS } from './api'
+import {
+  EventApi,
+  EventApiError,
+  AUTOMATIONS,
+  AUTOMATIONS_LISTING,
+  POLICIES,
+  WEBHOOKS
+} from './api'
 import {
   CallbackUrl,
   SubscribeParams,
@@ -288,7 +295,7 @@ export class EventService {
       const { account_id: _accountId, ...trigger } = params.arguments
       const automationBody = { ...trigger, name, policyId: resolvedPolicyId, enabled: false }
       const automationId =
-        (await api.find(AUTOMATIONS, name, 'automations')) ??
+        (await api.find(AUTOMATIONS, name, AUTOMATIONS_LISTING)) ??
         (await api.create(AUTOMATIONS, automationBody, 'automation'))
       await api.result(`${WEBHOOKS}/${encodeURIComponent(state.webhookId)}`, 'PUT', {
         name,
@@ -335,7 +342,7 @@ export class EventService {
           enabled: false
         })
       }
-      const automationId = await api.find(AUTOMATIONS, name, 'automations')
+      const automationId = await api.find(AUTOMATIONS, name, AUTOMATIONS_LISTING)
       if (automationId) await api.remove(`${AUTOMATIONS}/${encodeURIComponent(automationId)}`)
       if (policyId) await api.remove(`${POLICIES}/${encodeURIComponent(policyId)}`)
       const webhookId = await api.find(WEBHOOKS, name)

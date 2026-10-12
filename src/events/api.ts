@@ -56,17 +56,26 @@ export class EventApi {
     return (await this.request(path, method, body)).result
   }
 
-  async find(path: string, name: string, collection?: string): Promise<string | undefined> {
+  /**
+   * Find a managed resource by its exact name.
+   *
+   * ANS lists are paginated. The issue automations list is not, and rejects
+   * any `page` or `per_page` query with 400 (an account holds at most 50).
+   */
+  async find(path: string, name: string, listing: Listing = PAGED): Promise<string | undefined> {
     for (let page = 1; page <= 100; page++) {
-      const envelope = await this.request(`${path}?page=${page}&per_page=100`)
-      const value = collection
-        ? z.record(z.string(), z.unknown()).parse(envelope.result)[collection]
+      const envelope = await this.request(
+        listing.pagination === 'paged' ? `${path}?page=${page}&per_page=100` : path
+      )
+      const value = listing.collection
+        ? z.record(z.string(), z.unknown()).parse(envelope.result)[listing.collection]
         : envelope.result
       const resources = z.array(Resource).parse(value)
       const found = resources.find((resource) => resource.name === name)
       if (resources.filter((resource) => resource.name === name).length > 1)
         throw new EventApiError(409)
       if (found) return found.id
+      if (listing.pagination === 'unpaged') return
       if (!envelope.result_info?.total_pages || page >= envelope.result_info.total_pages) return
     }
     throw new EventApiError(503)
@@ -87,6 +96,17 @@ export class EventApi {
     }
   }
 }
+
+/** How a Cloudflare list endpoint pages its results and where it nests them. */
+export interface Listing {
+  readonly pagination: 'paged' | 'unpaged'
+  readonly collection?: string
+}
+
+const PAGED: Listing = { pagination: 'paged' }
+
+/** The issue automations list: one unpaginated page under `result.automations`. */
+export const AUTOMATIONS_LISTING: Listing = { pagination: 'unpaged', collection: 'automations' }
 
 export const WEBHOOKS = '/alerting/v3/destinations/webhooks'
 export const POLICIES = '/alerting/v3/policies'

@@ -157,6 +157,14 @@ beforeEach(async () => {
       const records = resources.get(collection)!
       const resourceId = path === collection ? undefined : path.slice(collection.length + 1)
       requests.push({ method: request.method, path })
+      // The real automations list is unpaginated and rejects page/per_page with 400.
+      const search = new URL(request.url).searchParams
+      if (
+        collection === AUTOMATIONS &&
+        request.method === 'GET' &&
+        (search.has('page') || search.has('per_page'))
+      )
+        return HttpResponse.json({ success: false, errors: [] }, { status: 400 })
       if (failNext === `${request.method} ${collection}`) {
         failNext = ''
         return HttpResponse.json({ success: false, errors: [] }, { status: 503 })

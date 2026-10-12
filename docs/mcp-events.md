@@ -24,7 +24,8 @@ The MCP Worker is stateless. Resources have a deterministic `MCP Events sub_…`
 derived from the server, principal, event, arguments and callback URL. Refresh reuses
 them. Unsubscribe disables the policy first, then removes the automation, policy
 and destination. Retry a failed subscribe to resume partial provisioning, or
-unsubscribe to remove it. No additional database, Durable Object or queue is used.
+unsubscribe to remove it. No Durable Object, queue or new binding is used; the only
+state outside ANS is a short-lived delivery ticket in the existing `OAUTH_KV`.
 
 ANS's generic webhook format differs from MCP Events, so its destination targets
 `/events/ans/{subscriptionId}` on this server. This route checks the current policy
@@ -37,10 +38,21 @@ Vega → ANS policy/destination → MCP callback adapter → subscriber
 ### Metadata and credentials
 
 The policy description contains encrypted MCP metadata: owner, arguments, callback
-URL, signing keys, destination ID and expiry. The destination's write-only secret
-contains an encrypted delivery credential and policy/account binding. ANS sends it
-to the adapter in `cf-webhook-auth`; credentials are never placed in URLs or returned
-to MCP clients. Both records use AES-GCM with a purpose-specific key derived from
+URL, signing keys, destination ID and expiry.
+
+ANS keeps a destination's secret from creation and ignores later updates, so the
+secret is a fixed per-subscription ingress credential,
+`HMAC(key, MCP_RESOURCE + subscription ID)`. It only proves the caller is ANS for
+that subscription. Everything that changes on refresh (policy ID, the subscriber's
+current bearer, expiry) is a delivery ticket in `OAUTH_KV` under
+`mcp-events:ticket:<subscription ID>`, rewritten on every subscribe and refresh and
+expiring with the subscription. The callback checks `cf-webhook-auth` against the
+HMAC, reads the ticket, and acknowledges without forwarding when there is none
+(ANS's creation probe, expiry or unsubscribe). Unsubscribe deletes the ticket
+first, so forwarding stops even if ANS cleanup fails.
+
+Credentials are never placed in URLs or returned to MCP clients. The policy state
+and the ticket use AES-GCM with a purpose-specific key derived from
 `MCP_COOKIE_ENCRYPTION_KEY`, bound to `MCP_RESOURCE` and the subscription.
 
 No refresh token is retained. Provider-issued MCP tokens are revalidated through the

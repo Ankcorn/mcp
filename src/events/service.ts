@@ -27,7 +27,10 @@ import {
   PolicyState,
   credentialInfo,
   decryptState,
+  deleteDeliveryTicket,
   encryptState,
+  ingressSecret,
+  writeDeliveryTicket,
   type EventEnvironment
 } from './state'
 
@@ -267,23 +270,14 @@ export class EventService {
       }
       const url = new URL(`/events/ans/${id}`, this.env.MCP_RESOURCE).href
       CallbackUrl.parse(url)
-      const ticket = {
-        id,
-        accountId: params.arguments.account_id,
-        bearer: this.bearer,
-        providerIssued: credential.providerIssued,
-        expiresAt
-      }
+      // ANS keeps a destination's secret from creation and ignores updates, so
+      // the secret is a fixed per-subscription ingress credential. Everything
+      // that changes on refresh lives in the KV delivery ticket below. ANS
+      // probes the destination on creation; with no ticket yet, the callback
+      // acknowledges the probe without forwarding it.
       state.webhookId =
         (await api.find(WEBHOOKS, name)) ??
-        (await api.create(WEBHOOKS, {
-          name,
-          url,
-          secret: await encryptState(this.env, `delivery:${id}`, {
-            ...ticket,
-            expiresAt: now + 60_000
-          })
-        }))
+        (await api.create(WEBHOOKS, { name, url, secret: await ingressSecret(this.env, id) }))
       const policyBody = {
         name,
         enabled: false,
@@ -302,14 +296,20 @@ export class EventService {
       const automationId =
         (await api.find(AUTOMATIONS, name, AUTOMATIONS_LISTING)) ??
         (await api.create(AUTOMATIONS, automationBody, 'automation'))
-      await api.result(`${WEBHOOKS}/${encodeURIComponent(state.webhookId)}`, 'PUT', {
-        name,
-        url,
-        secret: await encryptState(this.env, `delivery:${id}`, {
-          ...ticket,
-          policyId: resolvedPolicyId
-        })
-      })
+      // Write the ticket before enabling delivery, so the first alert finds it.
+      // Refreshes rewrite it with the caller's current bearer and expiry.
+      await writeDeliveryTicket(
+        this.env,
+        {
+          id,
+          accountId: params.arguments.account_id,
+          policyId: resolvedPolicyId,
+          bearer: this.bearer,
+          providerIssued: credential.providerIssued,
+          expiresAt
+        },
+        now
+      )
       await api.result(`${POLICIES}/${encodeURIComponent(resolvedPolicyId)}`, 'PUT', {
         ...policyBody,
         enabled: true
@@ -332,6 +332,9 @@ export class EventService {
     if (!isSupportedEventName(params.name)) throw new EventNotFound(params.name)
     const id = await subscriptionId(`${this.env.MCP_RESOURCE}:${this.principal}`, params)
     return serialized(id, async () => {
+      // Stop forwarding first, so delivery ends even if ANS cleanup fails. The
+      // ID is derived from this principal, so it can only name its own ticket.
+      await deleteDeliveryTicket(this.env, id)
       const api = this.api(params.arguments.account_id)
       const name = managedName(id)
       const policyId = await api.find(POLICIES, name)

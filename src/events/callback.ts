@@ -1,14 +1,20 @@
 import { EventApi, EventApiError, POLICIES, AUTOMATIONS } from './api'
-import { forwardAnsWebhook } from './ans-bridge'
+import { constantTimeEqual, forwardAnsWebhook } from './ans-bridge'
 import { ManagedPolicy, asSubscription, publicWebhookFetch, readPolicyState } from './service'
-import { DeliveryTicket, decryptState, deliveryAccessToken, type EventEnvironment } from './state'
+import {
+  deliveryAccessToken,
+  ingressSecret,
+  readDeliveryTicket,
+  type DeliveryTicket,
+  type EventEnvironment
+} from './state'
 
 /**
  * Why a callback from ANS was acknowledged, dropped or bounced. Logged once
  * per callback with safe fields only, so silent 204s can be told apart.
  */
 type CallbackOutcome =
-  | 'bootstrap_probe'
+  | 'no_ticket'
   | 'ticket_expired'
   | 'credential_unavailable'
   | 'access_denied'
@@ -40,16 +46,19 @@ export async function handleAnsCallback(
   const match = /^\/events\/ans\/(sub_[a-f0-9]{64})$/.exec(new URL(request.url).pathname)
   if (!match) return new Response(null, { status: 404 })
   const id = match[1]
-  const secret = request.headers.get('cf-webhook-auth') ?? ''
-  let ticket: DeliveryTicket
+  const secret = await ingressSecret(env, id)
+  if (!(await constantTimeEqual(request.headers.get('cf-webhook-auth') ?? '', secret)))
+    return new Response(null, { status: 401 })
+  let ticket: DeliveryTicket | null
   try {
-    ticket = DeliveryTicket.parse(await decryptState(env, `delivery:${id}`, secret))
-    if (ticket.id !== id) return new Response(null, { status: 401 })
+    ticket = await readDeliveryTicket(env, id)
   } catch {
+    // Unreadable (e.g. the encryption key rotated): fail closed, don't retry.
     return new Response(null, { status: 401 })
   }
-  if (!ticket.policyId) {
-    logOutcome(id, 'bootstrap_probe', 204)
+  // No ticket: ANS's creation probe, or the subscription expired or ended.
+  if (!ticket) {
+    logOutcome(id, 'no_ticket', 204)
     return new Response(null, { status: 204 })
   }
   if (ticket.expiresAt <= Date.now()) {

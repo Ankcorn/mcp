@@ -207,6 +207,9 @@ beforeEach(async () => {
       }
       const id = resourceId ?? crypto.randomUUID().replaceAll('-', '')
       const value = { ...input, id } as Resource
+      // Like real ANS: a destination keeps the secret it was created with.
+      if (collection === WEBHOOKS && request.method === 'PUT' && records.has(id))
+        value.secret = records.get(id)!.secret
       records.set(id, value)
       return HttpResponse.json(
         cfSuccess(collection === AUTOMATIONS ? { automation: value } : { id })
@@ -390,6 +393,40 @@ describe('MCP Events through the real Worker', () => {
     vi.spyOn(Date, 'now').mockReturnValue(Date.parse(result.result!.refreshBefore!) + 1)
     expect((await exports.default.fetch(ansRequest())).status).toBe(204)
     expect(deliveries).toHaveLength(0)
+  })
+
+  it('keeps delivering after a refresh extends the subscription past its first expiry', async () => {
+    const initial = await rpc('events/subscribe', { ...params, ttlMs: 10 * 60_000 })
+    const firstExpiry = Date.parse(initial.result!.refreshBefore!)
+    // Refresh shortly before expiry, with a longer lifetime.
+    vi.spyOn(Date, 'now').mockReturnValue(firstExpiry - 60_000)
+    const refreshed = await rpc('events/subscribe', { ...params, ttlMs: 30 * 60_000 })
+    expect(Date.parse(refreshed.result!.refreshBefore!)).toBeGreaterThan(firstExpiry)
+    // Past the first expiry: the ANS secret never changed, but the ticket did.
+    vi.spyOn(Date, 'now').mockReturnValue(firstExpiry + 60_000)
+    expect((await exports.default.fetch(ansRequest())).status).toBe(204)
+    expect(deliveries).toHaveLength(1)
+  })
+
+  it('stops forwarding on unsubscribe even when ANS cleanup fails', async () => {
+    await rpc('events/subscribe', params)
+    const destination = [...records(WEBHOOKS).values()][0]
+    failNext = `GET ${POLICIES}`
+    const { secret: _secret, ...delivery } = params.delivery
+    expect((await rpc('events/unsubscribe', { ...params, delivery })).error).toBeDefined()
+    expect((await exports.default.fetch(ansRequest(destination))).status).toBe(204)
+    expect(deliveries).toHaveLength(0)
+  })
+
+  it('keeps the delivery ticket encrypted in KV and out of ANS', async () => {
+    await rpc('events/subscribe', params)
+    const { keys } = await env.OAUTH_KV.list({ prefix: 'mcp-events:ticket:' })
+    expect(keys).toHaveLength(1)
+    const stored = await env.OAUTH_KV.get(keys[0].name)
+    expect(stored).not.toContain(token)
+    const destination = [...records(WEBHOOKS).values()][0]
+    expect(String(destination.secret)).toMatch(/^mcp-events-ingress-v1:/)
+    expect(JSON.stringify([...resources.values()].map((r) => [...r.values()]))).not.toContain(token)
   })
 
   it('drops a delivery the receiver rejects with 410 but keeps the subscription', async () => {
